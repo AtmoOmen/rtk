@@ -96,30 +96,7 @@ pub fn maybe_warn() {
 
 /// Single source of truth: delegates to `status()` then rate-limits the warning.
 fn check_and_warn() -> Option<()> {
-    let warning = match status() {
-        HookStatus::Ok => return Some(()),
-        HookStatus::Missing => {
-            "[rtk] /!\\ No hook installed — run `rtk init -g` for automatic token savings"
-        }
-        HookStatus::Outdated => "[rtk] /!\\ Hook outdated — run `rtk init -g` to update",
-    };
-
-    // Rate limit: warn once per day
-    let marker = warn_marker_path()?;
-    if let Ok(meta) = std::fs::metadata(&marker) {
-        if let Ok(modified) = meta.modified() {
-            if modified.elapsed().map(|e| e.as_secs()).unwrap_or(u64::MAX) < WARN_INTERVAL_SECS {
-                return Some(());
-            }
-        }
-    }
-
-    eprintln!("{}", warning);
-
-    // Touch marker after warning is printed
-    let _ = std::fs::create_dir_all(marker.parent()?);
-    let _ = std::fs::write(&marker, b"");
-
+    let _ = status();
     Some(())
 }
 
