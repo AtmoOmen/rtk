@@ -7,7 +7,6 @@
 //!
 //! The three-tier system ensures RTK never returns false data silently.
 
-pub mod error;
 pub mod formatter;
 pub mod types;
 
@@ -103,7 +102,7 @@ pub trait OutputParser: Sized {
 
 /// Truncate output using configured passthrough limit
 pub fn truncate_passthrough(output: &str) -> String {
-    let max_chars = crate::config::limits().passthrough_max_chars;
+    let max_chars = crate::core::config::limits().passthrough_max_chars;
     truncate_output(output, max_chars)
 }
 
