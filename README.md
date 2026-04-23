@@ -110,6 +110,7 @@ rtk init --agent windsurf       # Windsurf
 rtk init --agent cline          # Cline / Roo Code
 rtk init --agent kilocode       # Kilo Code
 rtk init --agent antigravity    # Google Antigravity
+rtk init --agent kimi           # Kimi AI
 
 # 2. Restart your AI tool, then test
 git status  # Automatically rewritten to rtk git status
@@ -367,6 +368,7 @@ RTK supports 12 AI coding tools. Each integration transparently rewrites shell c
 | **Mistral Vibe** | Planned ([#800](https://github.com/rtk-ai/rtk/issues/800)) | Blocked on upstream |
 | **Kilo Code** | `rtk init --agent kilocode` | .kilocode/rules/rtk-rules.md (project-scoped) |
 | **Google Antigravity** | `rtk init --agent antigravity` | .agents/rules/antigravity-rtk-rules.md (project-scoped) |
+| **Kimi AI** | `rtk init --agent kimi` | .kimirules (project-scoped) |
 
 For per-agent setup details, override controls, and graceful degradation, see the [Supported Agents guide](https://www.rtk-ai.app/guide/getting-started/supported-agents).
 

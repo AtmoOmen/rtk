@@ -44,6 +44,8 @@ pub enum AgentTarget {
     Kilocode,
     /// Google Antigravity
     Antigravity,
+    /// Kimi AI
+    Kimi,
 }
 
 #[derive(Parser)]
@@ -1785,6 +1787,11 @@ fn run_cli() -> Result<i32> {
                     );
                 }
                 hooks::init::run_antigravity_mode(cli.verbose)?;
+            } else if agent == Some(AgentTarget::Kimi) {
+                if global {
+                    anyhow::bail!("Kimi AI is project-scoped. Use: rtk init --agent kimi");
+                }
+                hooks::init::run_kimi_mode(cli.verbose)?;
             } else {
                 let install_opencode = opencode;
                 let install_claude = !opencode;

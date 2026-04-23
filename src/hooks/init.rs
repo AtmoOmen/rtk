@@ -1405,6 +1405,44 @@ fn run_antigravity_mode_at(base_dir: &Path, verbose: u8) -> Result<()> {
     Ok(())
 }
 
+// ─── Kimi AI support ──────────────────────────────────────────
+
+const KIMI_RULES: &str = include_str!("../../hooks/kimi/rules.md");
+
+pub fn run_kimi_mode(verbose: u8) -> Result<()> {
+    run_kimi_mode_at(&std::env::current_dir()?, verbose)
+}
+
+fn run_kimi_mode_at(base_dir: &Path, verbose: u8) -> Result<()> {
+    // Kimi AI reads .kimirules from the project root (workspace-scoped)
+    let rules_path = base_dir.join(".kimirules");
+
+    let existing = fs::read_to_string(&rules_path).unwrap_or_default();
+    if existing.contains("RTK") || existing.contains("rtk") {
+        println!("\nRTK already configured for Kimi AI in this project.\n");
+        println!("  Rules: .kimirules (already present)");
+    } else {
+        let new_content = if existing.trim().is_empty() {
+            KIMI_RULES.to_string()
+        } else {
+            format!("{}\n\n{}", existing.trim(), KIMI_RULES)
+        };
+        fs::write(&rules_path, &new_content)
+            .context("Failed to write .kimirules")?;
+
+        if verbose > 0 {
+            eprintln!("Wrote .kimirules");
+        }
+
+        println!("\nRTK configured for Kimi AI.\n");
+        println!("  Rules: .kimirules (installed)");
+    }
+    println!("  Kimi AI will now use rtk commands for token savings.");
+    println!("  Test with: git status\n");
+
+    Ok(())
+}
+
 fn run_codex_mode(global: bool, verbose: u8) -> Result<()> {
     let (agents_md_path, rtk_md_path) = if global {
         let codex_dir = resolve_codex_dir()?;
@@ -2953,6 +2991,31 @@ More notes
 
         // Second run should not overwrite
         run_antigravity_mode_at(temp.path(), 0).unwrap();
+        let second = fs::read_to_string(&path).unwrap();
+        assert_eq!(first, second, "Idempotent: content should not change");
+    }
+
+    #[test]
+    fn test_kimi_mode_creates_rules_file() {
+        let temp = TempDir::new().unwrap();
+        run_kimi_mode_at(temp.path(), 0).unwrap();
+
+        let rules_path = temp.path().join(".kimirules");
+        assert!(rules_path.exists(), "Rules file should be created");
+        let content = fs::read_to_string(&rules_path).unwrap();
+        assert!(content.contains("RTK"), "Rules file should contain RTK");
+    }
+
+    #[test]
+    fn test_kimi_mode_is_idempotent() {
+        let temp = TempDir::new().unwrap();
+        run_kimi_mode_at(temp.path(), 0).unwrap();
+
+        let path = temp.path().join(".kimirules");
+        let first = fs::read_to_string(&path).unwrap();
+
+        // Second run should not overwrite
+        run_kimi_mode_at(temp.path(), 0).unwrap();
         let second = fs::read_to_string(&path).unwrap();
         assert_eq!(first, second, "Idempotent: content should not change");
     }
