@@ -8,40 +8,116 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use std::collections::HashMap;
 
-/// Extracts (pattern, path, flags) from the raw trailing args.
+/// Short flags (exact 2-char form `-X`) that consume one following token as their value.
+/// `-e` is handled separately — its value goes into `patterns`, not `flags`.
+/// Deliberately small: unknown flags pass through unchanged. The failure mode
+/// for a missing entry is a visible wrong result, not a silent corruption.
+const VALUE_FLAGS_SHORT: &[u8] = b"ABCgfjm";
+
+/// Normalise a flag arg for rg forwarding.
+/// Returns `None` when the flag should be dropped (grep-ism recursive flags).
+fn process_flag(arg: &str) -> Option<String> {
+    if arg == "--recursive" {
+        return None;
+    }
+    // Long flags pass through unchanged.
+    if arg.starts_with("--") {
+        return Some(arg.to_string());
+    }
+    // Short clusters: strip `r`/`R` (grep recursive; rg -r means --replace).
+    if let Some(rest) = arg.strip_prefix('-') {
+        let cleaned: String = rest.chars().filter(|&c| c != 'r' && c != 'R').collect();
+        return if cleaned.is_empty() {
+            None
+        } else {
+            Some(format!("-{}", cleaned))
+        };
+    }
+    Some(arg.to_string())
+}
+
+/// Extracts `(patterns, paths, flags)` from the raw trailing args.
 ///
-/// Scans for the first and second non-flag positional arguments. Everything
-/// after `--` is also considered positional. Flags (args starting with `-`)
-/// are collected as pass-through args for rg.
-fn extract_pattern_path(args: &[String]) -> (Option<String>, String, Vec<String>) {
+/// - `patterns`: first non-flag positional prepended to any `-e` values.
+///   All patterns are passed to rg as `-e` flags, so positional and `-e` are
+///   interchangeable from rg's perspective. Empty → caller should error.
+/// - `paths`: all subsequent non-flag positionals. Empty → caller defaults to `["."]`.
+/// - `flags`: other flags forwarded to rg (recursive flags already stripped).
+///
+/// Value-taking short flags (see `VALUE_FLAGS_SHORT`) consume the next token
+/// as their value so it is not mistaken for the pattern. Combined clusters like
+/// `-rn` have `r`/`R` stripped before forwarding. `--` marks everything after
+/// it as positional even if flag-shaped.
+fn extract_pattern_path(args: &[String]) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut e_patterns: Vec<String> = Vec::new();
     let mut positionals: Vec<String> = Vec::new();
     let mut flags: Vec<String> = Vec::new();
     let mut past_dashdash = false;
+    let mut i = 0;
 
-    for arg in args {
-        if arg == "--" {
-            past_dashdash = true;
+    while i < args.len() {
+        let arg = &args[i];
+
+        if past_dashdash {
+            positionals.push(arg.clone());
+            i += 1;
             continue;
         }
-        if past_dashdash || !arg.starts_with('-') {
-            positionals.push(arg.clone());
+
+        if arg == "--" {
+            past_dashdash = true;
+            i += 1;
+            continue;
+        }
+
+        if arg.starts_with('-') {
+            // -e: consume value into patterns (not flags)
+            if arg == "-e" {
+                if i + 1 < args.len() {
+                    e_patterns.push(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+
+            // Exact 2-char value-taking flag: consume next token as value
+            if arg.len() == 2
+                && VALUE_FLAGS_SHORT.contains(&arg.as_bytes()[1])
+            {
+                flags.push(arg.clone());
+                if i + 1 < args.len() {
+                    flags.push(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+
+            // Strip recursive flags; pass everything else through
+            if let Some(cleaned) = process_flag(arg) {
+                flags.push(cleaned);
+            }
+            i += 1;
         } else {
-            flags.push(arg.clone());
+            positionals.push(arg.clone());
+            i += 1;
         }
     }
 
-    let pattern = positionals.first().cloned();
-    let path = positionals
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| ".".to_string());
+    // If -e was used: all positionals are paths; -e values are the patterns.
+    // If -e was not used: first positional is the pattern, rest are paths.
+    let (patterns, paths) = if !e_patterns.is_empty() {
+        (e_patterns, positionals)
+    } else {
+        let paths = positionals.iter().skip(1).cloned().collect();
+        let patterns = positionals.into_iter().take(1).collect();
+        (patterns, paths)
+    };
 
-    // Any extra positionals beyond pattern+path go back into flags for rg.
-    for extra in positionals.iter().skip(2) {
-        flags.push(extra.clone());
-    }
-
-    (pattern, path, flags)
+    (patterns, paths, flags)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -82,19 +158,29 @@ pub fn run(
     // Re-insert `--` when clap's trailing_var_arg consumed it
     let args = args_utils::restore_double_dash(args);
 
-    let (pattern_opt, path, extra_args) = extract_pattern_path(&args);
+    let (patterns, paths, extra_args) = extract_pattern_path(&args);
 
-    let Some(pattern) = pattern_opt else {
-        eprintln!("rtk grep: pattern required");
+    if patterns.is_empty() {
+        eprintln!("rtk grep: pattern required (positional or -e)");
         return Ok(1);
-    };
-
-    if verbose > 0 {
-        eprintln!("grep: '{}' in {}", pattern, path);
     }
 
-    // Fix: convert BRE alternation \| → | for rg (which uses PCRE-style regex)
-    let rg_pattern = pattern.replace(r"\|", "|");
+    let display_pattern = if patterns.len() == 1 {
+        patterns[0].clone()
+    } else {
+        patterns.join("|")
+    };
+
+    let paths = if paths.is_empty() {
+        vec![".".to_string()]
+    } else {
+        paths
+    };
+    let path_display = paths.join(" ");
+
+    if verbose > 0 {
+        eprintln!("grep: '{}' in {}", display_pattern, path_display);
+    }
 
     let mut rg_cmd = resolved_command("rg");
     // --no-ignore-vcs: match grep -r behavior (don't skip .gitignore'd files).
@@ -110,27 +196,31 @@ pub fn run(
         rg_cmd.arg("--type").arg(ft);
     }
 
-    for arg in &extra_args {
-        // Fix: skip grep-ism -r flag (rg is recursive by default; rg -r means --replace)
-        if arg == "-r" || arg == "--recursive" {
-            continue;
-        }
-        rg_cmd.arg(arg);
+    // extra_args is already stripped of -r/-R/-recursive by extract_pattern_path
+    rg_cmd.args(&extra_args);
+
+    // All patterns as -e flags (BRE \| → | translation for rg's PCRE engine).
+    // Using -e keeps `--` semantically as a flag/path separator, not part of the pattern.
+    for p in &patterns {
+        rg_cmd.args(["-e", &p.replace(r"\|", "|")]);
     }
 
-    // `--` after all flags, before pattern + path: prevents rg from interpreting
-    // patterns starting with `-` (e.g. `--version`) as its own flags.
-    rg_cmd.args(["--", &rg_pattern, &path]);
+    // `--` after all flags: prevents rg from interpreting path args starting
+    // with `-` as its own flags.
+    rg_cmd.arg("--");
+    rg_cmd.args(&paths);
 
     let result = exec_capture(&mut rg_cmd)
         .or_else(|_| {
             // rg unavailable: fall back to system grep with the original,
-            // untranslated pattern (grep interprets BRE natively).
-            // `--` before pattern keeps grep from misreading flag-like patterns.
+            // untranslated patterns (grep interprets BRE natively).
             let mut grep_cmd = resolved_command("grep");
-            grep_cmd
-                .args(&extra_args)
-                .args(["-rnHZ", "--", &pattern, &path]);
+            grep_cmd.args(&extra_args);
+            for p in &patterns {
+                grep_cmd.args(["-e", p]);
+            }
+            grep_cmd.args(["-rnHZ", "--"]);
+            grep_cmd.args(&paths);
             exec_capture(&mut grep_cmd)
         })
         .context("grep/rg failed")?;
@@ -143,9 +233,9 @@ pub fn run(
         }
 
         let args_display = if extra_args.is_empty() {
-            format!("'{}' {}", pattern, path)
+            format!("'{}' {}", display_pattern, path_display)
         } else {
-            format!("{} '{}' {}", extra_args.join(" "), pattern, path)
+            format!("{} '{}' {}", extra_args.join(" "), display_pattern, path_display)
         };
 
         timer.track_passthrough(
@@ -163,10 +253,10 @@ pub fn run(
         if exit_code == 2 && !result.stderr.trim().is_empty() {
             eprintln!("{}", result.stderr.trim());
         }
-        let msg = format!("0 matches for '{}'", pattern);
+        let msg = format!("0 matches for '{}'", display_pattern);
         println!("{}", msg);
         timer.track(
-            &format!("grep -rn '{}' {}", pattern, path),
+            &format!("grep -rn '{}' {}", display_pattern, path_display),
             "rtk grep",
             &raw_output,
             &msg,
@@ -175,7 +265,11 @@ pub fn run(
     }
 
     let context_re = if context_only {
-        Regex::new(&format!("(?i).{{0,20}}{}.*", regex::escape(&pattern))).ok()
+        Regex::new(&format!(
+            "(?i).{{0,20}}{}.*",
+            regex::escape(&display_pattern)
+        ))
+        .ok()
     } else {
         None
     };
@@ -185,7 +279,7 @@ pub fn run(
         let Some((file, line_num, content)) = parse_match_line(line) else {
             continue;
         };
-        let cleaned = clean_line(content, max_line_len, context_re.as_ref(), &pattern);
+        let cleaned = clean_line(content, max_line_len, context_re.as_ref(), &display_pattern);
         by_file.entry(file).or_default().push((line_num, cleaned));
     }
 
@@ -225,7 +319,7 @@ pub fn run(
 
     print!("{}", rtk_output);
     timer.track(
-        &format!("grep -rn '{}' {}", pattern, path),
+        &format!("grep -rn '{}' {}", display_pattern, path_display),
         "rtk grep",
         &raw_output,
         &rtk_output,
@@ -357,14 +451,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extra_args_accepted() {
-        // Test that the function signature accepts extra_args
-        // This is a compile-time test - if it compiles, the signature is correct
-        let _extra: Vec<String> = vec!["-i".to_string(), "-A".to_string(), "3".to_string()];
-        // No need to actually run - we're verifying the parameter exists
-    }
-
-    #[test]
     fn test_clean_line_multibyte() {
         // Thai text that exceeds max_len in bytes
         let line = "  สวัสดีครับ นี่คือข้อความที่ยาวมากสำหรับทดสอบ  ";
@@ -388,61 +474,117 @@ mod tests {
         assert_eq!(rg_pattern, "fn foo|pub.*bar");
     }
 
-    // Fix: -r flag (grep recursive) is stripped from extra_args (rg is recursive by default)
+    // --- process_flag ---
+
     #[test]
-    fn test_recursive_flag_stripped() {
-        let extra_args: Vec<String> = vec!["-r".to_string(), "-i".to_string()];
-        let filtered: Vec<&String> = extra_args
-            .iter()
-            .filter(|a| *a != "-r" && *a != "--recursive")
-            .collect();
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0], "-i");
+    fn test_process_flag_strip_r() {
+        assert_eq!(process_flag("-r"), None);
+        assert_eq!(process_flag("-R"), None);
+        assert_eq!(process_flag("--recursive"), None);
+        assert_eq!(process_flag("-rn"), Some("-n".to_string()));
+        assert_eq!(process_flag("-Rni"), Some("-ni".to_string()));
+        assert_eq!(process_flag("-i"), Some("-i".to_string()));
+        assert_eq!(process_flag("--glob"), Some("--glob".to_string()));
     }
 
     // --- extract_pattern_path ---
 
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
     #[test]
-    fn test_extract_pattern_path_simple() {
-        let args = vec!["foo".to_string(), "src/".to_string()];
-        let (pat, path, flags) = extract_pattern_path(&args);
-        assert_eq!(pat.as_deref(), Some("foo"));
-        assert_eq!(path, "src/");
+    fn test_extract_simple() {
+        let (patterns, paths, flags) = extract_pattern_path(&s(&["foo", "src/"]));
+        assert_eq!(patterns, s(&["foo"]));
+        assert_eq!(paths, s(&["src/"]));
         assert!(flags.is_empty());
     }
 
     #[test]
-    fn test_extract_pattern_path_with_flags() {
-        let args = vec!["-i".to_string(), "foo".to_string(), "src/".to_string()];
-        let (pat, path, flags) = extract_pattern_path(&args);
-        assert_eq!(pat.as_deref(), Some("foo"));
-        assert_eq!(path, "src/");
-        assert_eq!(flags, vec!["-i"]);
+    fn test_extract_with_bool_flag() {
+        let (patterns, paths, flags) = extract_pattern_path(&s(&["-i", "foo", "src/"]));
+        assert_eq!(patterns, s(&["foo"]));
+        assert_eq!(paths, s(&["src/"]));
+        assert_eq!(flags, s(&["-i"]));
     }
 
     #[test]
-    fn test_extract_pattern_path_default_path() {
-        let args = vec!["foo".to_string()];
-        let (pat, path, _flags) = extract_pattern_path(&args);
-        assert_eq!(pat.as_deref(), Some("foo"));
-        assert_eq!(path, ".");
+    fn test_extract_value_taking_flag() {
+        // -A 2 must not steal "error" as its value
+        let (patterns, paths, flags) = extract_pattern_path(&s(&["-A", "2", "error", "src"]));
+        assert_eq!(patterns, s(&["error"]));
+        assert_eq!(paths, s(&["src"]));
+        assert_eq!(flags, s(&["-A", "2"]));
     }
 
     #[test]
-    fn test_extract_pattern_path_no_args() {
-        let (pat, path, _flags) = extract_pattern_path(&[]);
-        assert!(pat.is_none());
-        assert_eq!(path, ".");
+    fn test_extract_cluster_strip_r() {
+        // -rn: r stripped, n forwarded (not leaked to rg as --replace value)
+        let (patterns, paths, flags) = extract_pattern_path(&s(&["-rn", "foo", "src"]));
+        assert_eq!(patterns, s(&["foo"]));
+        assert_eq!(paths, s(&["src"]));
+        assert_eq!(flags, s(&["-n"]));
     }
 
     #[test]
-    fn test_extract_pattern_path_dashdash() {
+    fn test_extract_multi_path() {
+        let (patterns, paths, flags) = extract_pattern_path(&s(&["TODO", "src", "tests"]));
+        assert_eq!(patterns, s(&["TODO"]));
+        assert_eq!(paths, s(&["src", "tests"]));
+        assert!(flags.is_empty());
+    }
+
+    #[test]
+    fn test_extract_glob_value() {
+        // -g '*.md' must not steal "agent" as its value
+        let (patterns, paths, flags) =
+            extract_pattern_path(&s(&["-i", "x", "agent", "-g", "*.md"]));
+        assert_eq!(patterns, s(&["x"]));
+        assert_eq!(paths, s(&["agent"]));
+        assert_eq!(flags, s(&["-i", "-g", "*.md"]));
+    }
+
+    #[test]
+    fn test_extract_e_flag() {
+        let (patterns, paths, flags) = extract_pattern_path(&s(&["-e", "fn run", "src"]));
+        assert_eq!(patterns, s(&["fn run"]));
+        assert_eq!(paths, s(&["src"]));
+        assert!(flags.is_empty());
+    }
+
+    #[test]
+    fn test_extract_multi_e() {
+        let (patterns, paths, flags) =
+            extract_pattern_path(&s(&["-e", "foo", "-e", "bar", "src"]));
+        assert_eq!(patterns, s(&["foo", "bar"]));
+        assert_eq!(paths, s(&["src"]));
+        assert!(flags.is_empty());
+    }
+
+    #[test]
+    fn test_extract_dashdash_boundary() {
         // After --, args are positional even if they look like flags
-        let args = vec!["--".to_string(), "--version".to_string()];
-        let (pat, path, flags) = extract_pattern_path(&args);
-        assert_eq!(pat.as_deref(), Some("--version"));
-        assert_eq!(path, ".");
+        let (patterns, paths, flags) = extract_pattern_path(&s(&["--", "--version"]));
+        assert_eq!(patterns, s(&["--version"]));
+        assert!(paths.is_empty());
         assert!(flags.is_empty());
+    }
+
+    #[test]
+    fn test_extract_no_args() {
+        let (patterns, paths, flags) = extract_pattern_path(&[]);
+        assert!(patterns.is_empty());
+        assert!(paths.is_empty());
+        assert!(flags.is_empty());
+    }
+
+    #[test]
+    fn test_extract_default_path_empty() {
+        // Caller is responsible for defaulting empty paths to ["."]
+        let (patterns, paths, _) = extract_pattern_path(&s(&["foo"]));
+        assert_eq!(patterns, s(&["foo"]));
+        assert!(paths.is_empty());
     }
 
     // --- truncation accuracy ---
