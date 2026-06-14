@@ -51,6 +51,24 @@ const VALUE_FLAGS_LONG: &[&str] = &[
     "--colors",
 ];
 
+/// Strip `r`/`R` from the boolean-flag portion of a short cluster.
+/// Returns `None` when nothing remains (the cluster was purely recursive flags).
+///
+/// IMPORTANT: must only be called on the accumulated flag-letter prefix, never
+/// on inline values — `strip_r("carrot")` would corrupt the value to `"caot"`,
+/// which is exactly the original bug this function replaces.
+fn strip_r(flag_letters: &str) -> Option<String> {
+    let s: String = flag_letters
+        .chars()
+        .filter(|&c| c != 'r' && c != 'R')
+        .collect();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// Drop `--recursive` (grep-ism); pass all other long flags through unchanged.
 fn strip_recursive(arg: &str) -> Option<String> {
     match arg {
@@ -123,23 +141,23 @@ fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>,
 
         match arg.strip_prefix('-') {
             Some(rest) if !rest.is_empty() => {
-                // Left-to-right scan: r/R stripped, first value-taking char terminates.
+                // Left-to-right scan: accumulate flag letters (including r/R) into
+                // raw_prefix; strip_r is called at emit time so it is never applied
+                // to inline value bytes (which follow the first value-taking char).
                 let bytes = rest.as_bytes();
-                let mut bool_acc = String::new();
+                let mut raw_prefix = String::new();
                 let mut consumed_value = false;
                 let mut j = 0;
                 while j < bytes.len() {
                     let ch = bytes[j];
-                    if ch == b'r' || ch == b'R' {
-                        j += 1;
-                        continue;
-                    }
                     let is_e = ch == b'e';
                     if is_e || VALUE_FLAGS_SHORT.contains(&ch) {
-                        if !bool_acc.is_empty() {
-                            flags.push(format!("-{}", bool_acc));
+                        // Emit the boolean prefix with r/R stripped.
+                        if let Some(prefix) = strip_r(&raw_prefix) {
+                            flags.push(format!("-{}", prefix));
                         }
                         // Inline value = bytes after this char in the cluster.
+                        // strip_r is NOT called here — these are value bytes, not flags.
                         let inline = std::str::from_utf8(&bytes[j + 1..]).unwrap_or("");
                         if is_e {
                             if !inline.is_empty() {
@@ -167,12 +185,13 @@ fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>,
                         consumed_value = true;
                         break;
                     }
-                    bool_acc.push(ch as char);
+                    raw_prefix.push(ch as char);
                     j += 1;
                 }
                 if !consumed_value {
-                    if !bool_acc.is_empty() {
-                        flags.push(format!("-{}", bool_acc));
+                    // Pure boolean cluster: strip r/R, emit remainder.
+                    if let Some(stripped) = strip_r(&raw_prefix) {
+                        flags.push(format!("-{}", stripped));
                     }
                     i += 1;
                 }
@@ -559,7 +578,26 @@ mod tests {
         assert_eq!(rg_pattern, "fn foo|pub.*bar");
     }
 
-    // --- strip_recursive ---
+    // --- strip_r / strip_recursive ---
+
+    #[test]
+    fn test_strip_r() {
+        // Pure r/R → None (whole cluster dropped)
+        assert_eq!(strip_r("r"), None);
+        assert_eq!(strip_r("R"), None);
+        assert_eq!(strip_r("rr"), None);
+        assert_eq!(strip_r("rR"), None);
+        assert_eq!(strip_r(""), None);
+        // Mixed → r/R removed, rest kept
+        assert_eq!(strip_r("rn"), Some("n".to_string()));
+        assert_eq!(strip_r("Rni"), Some("ni".to_string()));
+        assert_eq!(strip_r("rni"), Some("ni".to_string()));
+        assert_eq!(strip_r("i"), Some("i".to_string()));
+        // Reveals the danger: strip_r must NEVER be called on value bytes.
+        // Calling it on "carrot" strips both 'r's and produces "caot" — this
+        // is exactly the original bug (-ecarrot matching "caot" instead of "carrot").
+        assert_eq!(strip_r("carrot"), Some("caot".to_string()));
+    }
 
     #[test]
     fn test_strip_recursive() {
@@ -704,7 +742,11 @@ mod tests {
     fn test_extract_inline_e_value_no_rstrip() {
         // -ecarrot: the 'r' in "carrot" must NOT be stripped (it's value, not a flag)
         let (patterns, _, _) = extract_pattern_path(&["-ecarrot", "file"]);
-        assert_eq!(patterns, vec!["carrot"], "r in inline value must not be stripped");
+        assert_eq!(
+            patterns,
+            vec!["carrot"],
+            "r in inline value must not be stripped"
+        );
     }
 
     #[test]
@@ -720,15 +762,17 @@ mod tests {
     fn test_extract_inline_g_value_no_rstrip() {
         // -g*.rs: the 'r' in "*.rs" must NOT be stripped
         let (_, _, flags) = extract_pattern_path(&["aaa", "sub", "-g*.rs"]);
-        assert!(flags.contains(&"*.rs".to_string()), "r in glob value must not be stripped");
+        assert!(
+            flags.contains(&"*.rs".to_string()),
+            "r in glob value must not be stripped"
+        );
     }
 
     // --- long value-taking flags (Bug 5) ---
 
     #[test]
     fn test_extract_long_glob_value() {
-        let (patterns, paths, flags) =
-            extract_pattern_path(&["compact", "sub", "--glob", "*.md"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["compact", "sub", "--glob", "*.md"]);
         assert_eq!(patterns, vec!["compact"]);
         assert_eq!(paths, vec!["sub"]);
         assert_eq!(flags, vec!["--glob", "*.md"]);
@@ -736,8 +780,7 @@ mod tests {
 
     #[test]
     fn test_extract_long_max_count() {
-        let (patterns, paths, flags) =
-            extract_pattern_path(&["--max-count", "1", "fn", "file"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["--max-count", "1", "fn", "file"]);
         assert_eq!(patterns, vec!["fn"]);
         assert_eq!(paths, vec!["file"]);
         assert_eq!(flags, vec!["--max-count", "1"]);
@@ -782,8 +825,7 @@ mod tests {
     #[test]
     fn test_extract_long_regexp_multi() {
         // --regexp can be combined with -e
-        let (patterns, paths, _) =
-            extract_pattern_path(&["--regexp", "foo", "-e", "bar", "src"]);
+        let (patterns, paths, _) = extract_pattern_path(&["--regexp", "foo", "-e", "bar", "src"]);
         assert_eq!(patterns, vec!["foo", "bar"]);
         assert_eq!(paths, vec!["src"]);
     }
@@ -799,8 +841,7 @@ mod tests {
 
     #[test]
     fn test_extract_long_engine() {
-        let (patterns, paths, flags) =
-            extract_pattern_path(&["--engine", "pcre2", "foo", "src"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["--engine", "pcre2", "foo", "src"]);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["--engine", "pcre2"]);
