@@ -2189,6 +2189,24 @@ error: test run failed
     }
 
     #[test]
+    fn test_cargo_build_stream_json_success() {
+        let input = concat!(
+            "   Compiling demo v0.1.0 (/tmp/demo)\n",
+            r#"{"reason":"compiler-artifact","package_id":"demo 0.1.0","target":{"name":"demo"},"executable":"/tmp/demo/target/debug/demo"}"#,
+            "\n",
+            "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.39s\n",
+            r#"{"reason":"build-finished","success":true}"#,
+            "\n",
+        );
+        let mut f = BlockStreamFilter::new(CargoBuildHandler::new());
+        let result = run_block_filter(&mut f, input, 0);
+        assert!(result.contains("1 crates compiled"), "got: {}", result);
+        assert!(result.contains("Finished"), "got: {}", result);
+        assert!(!result.contains("error"), "got: {}", result);
+        assert!(!result.contains("Compiling"), "got: {}", result);
+    }
+
+    #[test]
     fn test_cargo_build_stream_errors() {
         let input = r#"   Compiling rtk v0.5.0
 error[E0308]: mismatched types
