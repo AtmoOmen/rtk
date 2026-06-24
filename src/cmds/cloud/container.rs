@@ -86,11 +86,6 @@ fn docker_ps(_verbose: u8) -> Result<i32> {
 
     let mut rtk = String::new();
 
-    if stdout.trim().is_empty() {
-        timer.track("docker ps", "rtk docker ps", &raw, "");
-        return Ok(0);
-    }
-
     const MAX_CONTAINERS: usize = CAP_LIST;
     let lines: Vec<String> = stdout
         .lines()
@@ -263,11 +258,6 @@ fn docker_images(_verbose: u8) -> Result<i32> {
 
     let lines: Vec<&str> = stdout.lines().collect();
     let mut rtk = String::new();
-
-    if lines.is_empty() {
-        timer.track("docker images", "rtk docker images", &raw, "");
-        return Ok(0);
-    }
 
     let mut total_size_mb: f64 = 0.0;
     for line in &lines {
