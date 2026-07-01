@@ -787,7 +787,10 @@ fn extract_json_diagnostics(raw: &str) -> JsonDiagnostics {
             _ => continue,
         };
         let text = msg["message"].as_str().unwrap_or("");
-        if text.starts_with("aborting due to") || text.starts_with("could not compile") {
+        if text.starts_with("aborting due to")
+            || text.starts_with("could not compile")
+            || (text.contains("warning") && text.contains("generated"))
+        {
             continue;
         }
         if let Some(rendered) = msg["rendered"].as_str() {
@@ -2259,6 +2262,24 @@ error: aborting due to 1 previous error
         assert!(result.contains("unused variable"), "got: {}", result);
         assert!(result.contains("1 warnings"), "got: {}", result);
         assert!(!result.contains("crates compiled"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_extract_json_diagnostics_skips_generated_summary() {
+        let output = concat!(
+            r#"{"reason":"compiler-message","message":{"level":"warning","message":"unused variable: `x`","rendered":"warning: unused variable: `x`"}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"level":"warning","message":"1 warning generated","rendered":"warning: 1 warning generated"}}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":true}"#,
+            "\n",
+        );
+        let json = extract_json_diagnostics(output);
+        assert_eq!(json.warnings.len(), 1, "generated summary must not inflate the count");
+        assert!(
+            !json.warnings.iter().any(|w| w.contains("generated")),
+            "the generated summary line must not appear in the output"
+        );
     }
 
     #[test]
