@@ -651,9 +651,12 @@ enum Commands {
 
     /// Trust project-local TOML filters in current directory
     Trust {
-        /// List all trusted projects
+        /// List all trusted filter files
         #[arg(long)]
         list: bool,
+        /// Trust without prompting (for non-interactive use)
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 
     /// Revoke trust for project-local TOML filters
@@ -2525,8 +2528,8 @@ fn run_cli() -> Result<i32> {
             core::utils::exit_code_from_status(&status, &cmd_name)
         }
 
-        Commands::Trust { list } => {
-            hooks::trust::run_trust(list)?;
+        Commands::Trust { list, yes } => {
+            hooks::trust::run_trust(list, yes)?;
             0
         }
 

@@ -212,14 +212,14 @@ pub fn gated_filter_paths() -> Vec<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// Run `rtk trust` — review and trust project-local filters.
-pub fn run_trust(list: bool) -> Result<()> {
+pub fn run_trust(list: bool, yes: bool) -> Result<()> {
     if list {
         let trusted = list_trusted()?;
         if trusted.is_empty() {
-            println!("No trusted project filters.");
+            println!("No trusted filters.");
             return Ok(());
         }
-        println!("Trusted project filters:");
+        println!("Trusted filters:");
         println!("{}", "═".repeat(60));
         for (path, entry) in &trusted {
             let date = entry.trusted_at.get(..10).unwrap_or(&entry.trusted_at);
@@ -229,46 +229,68 @@ pub fn run_trust(list: bool) -> Result<()> {
         return Ok(());
     }
 
+    let mut found_any = false;
     let mut trusted_any = false;
     for filter_path in gated_filter_paths() {
         if !filter_path.exists() {
             continue;
         }
-        trusted_any = true;
-
-        let content_bytes = std::fs::read(&filter_path)
+        let bytes = std::fs::read(&filter_path)
             .with_context(|| format!("Failed to read {}", filter_path.display()))?;
-        let content = String::from_utf8_lossy(&content_bytes);
-
-        println!("=== {} ===", filter_path.display());
-        println!("{}", content);
-        println!("{}", "=".repeat(60));
-        println!();
-
+        let content = String::from_utf8_lossy(&bytes);
+        let filters = crate::core::toml_filter::active_filter_summaries(&content);
+        if filters.is_empty() {
+            continue;
+        }
+        found_any = true;
+        print_filter_notice(&filter_path, &filters);
         print_risk_summary(&content);
 
-        let hash = {
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            h.update(&content_bytes);
-            format!("{:x}", h.finalize())
-        };
-
+        if !(yes || confirm_enable_at_tty()?) {
+            eprintln!("  Not enabled — re-run `rtk trust --yes` to trust non-interactively.");
+            continue;
+        }
+        let hash = crate::hooks::integrity::compute_hash_bytes(&bytes);
         trust_filter_with_hash(&filter_path, &hash)?;
-        println!();
-        println!(
-            "Trusted {} (sha256:{})",
-            filter_path.display(),
-            hash.get(..16).unwrap_or(&hash)
-        );
+        trusted_any = true;
+        eprintln!("  Enabled — revoke with `rtk untrust`.");
     }
 
-    if !trusted_any {
-        anyhow::bail!("No filters.toml found (.rtk/filters.toml or ~/.config/rtk/filters.toml)");
+    if !found_any {
+        anyhow::bail!("No custom filters found (.rtk/filters.toml or ~/.config/rtk/filters.toml)");
     }
-    println!("Filters will now be applied.");
-
+    if trusted_any {
+        println!("Filters will now be applied.");
+    }
     Ok(())
+}
+
+pub fn print_filter_notice(path: &Path, filters: &[(String, String)]) {
+    let yellow = "\x1b[33m";
+    let reset = "\x1b[0m";
+    eprintln!();
+    eprintln!(
+        "{yellow}Detected {} custom filter(s) in {} — they rewrite matching command output:{reset}",
+        filters.len(),
+        path.display()
+    );
+    for (name, regex) in filters {
+        eprintln!("{yellow}    {name:<20} {regex}{reset}");
+    }
+}
+
+pub fn confirm_enable_at_tty() -> Result<bool> {
+    use std::io::{self, BufRead, IsTerminal};
+    if !io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    eprint!("\x1b[33m  Enable these filters? [y/N] \x1b[0m");
+    let mut line = String::new();
+    io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("Failed to read user input")?;
+    Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 /// Run `rtk untrust` — revoke trust for project-local filters.
@@ -290,7 +312,7 @@ pub fn run_untrust() -> Result<()> {
 // Risk analysis
 // ---------------------------------------------------------------------------
 
-pub fn print_risk_summary(content: &str) {
+fn print_risk_summary(content: &str) {
     let filter_count = crate::core::toml_filter::active_filter_summaries(content).len();
     let has_replace = content.contains("replace");
     let has_match_output = content.contains("match_output");

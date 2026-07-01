@@ -1461,35 +1461,12 @@ pub fn finalize_filter_trust(global: bool, dry_run: bool, trust: FilterTrust) ->
         return Ok(());
     }
 
-    let yellow = "\x1b[33m";
-    let reset = "\x1b[0m";
-    eprintln!();
-    eprintln!(
-        "{yellow}Detected {} custom filter(s) in {} — they rewrite matching command output:{reset}",
-        filters.len(),
-        path.display()
-    );
-    for (name, regex) in &filters {
-        eprintln!("{yellow}    {name:<20} {regex}{reset}");
-    }
+    crate::hooks::trust::print_filter_notice(path, &filters);
 
     let enable = match trust {
         FilterTrust::Trust => true,
         FilterTrust::Skip => false,
-        FilterTrust::Ask => {
-            use std::io::{self, BufRead, IsTerminal};
-            if io::stdin().is_terminal() {
-                eprint!("{yellow}  Enable these filters? [y/N] {reset}");
-                let mut line = String::new();
-                io::stdin()
-                    .lock()
-                    .read_line(&mut line)
-                    .context("Failed to read user input")?;
-                matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
-            } else {
-                false
-            }
-        }
+        FilterTrust::Ask => crate::hooks::trust::confirm_enable_at_tty()?,
     };
 
     if enable {
@@ -1497,7 +1474,7 @@ pub fn finalize_filter_trust(global: bool, dry_run: bool, trust: FilterTrust) ->
         crate::hooks::trust::trust_filter_with_hash(path, &hash)?;
         eprintln!("Enabled. Revoke with `rtk untrust`.");
     } else {
-        eprintln!("{yellow}  Not enabled — run `rtk trust` to review and enable.{reset}");
+        eprintln!("\x1b[33m  Not enabled — run `rtk trust` to review and enable.\x1b[0m");
     }
     Ok(())
 }
