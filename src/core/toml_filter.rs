@@ -414,6 +414,12 @@ pub fn active_filter_summaries(content: &str) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+pub fn filter_parse_error(content: &str) -> Option<String> {
+    toml::from_str::<TomlFilterFile>(content)
+        .err()
+        .map(|e| e.to_string())
+}
+
 lazy_static! {
     static ref MATCH_SET: RegexSet = build_match_set();
 }
@@ -456,10 +462,14 @@ fn collect_match_patterns() -> Vec<String> {
 }
 
 fn match_patterns_in(content: &str) -> Vec<String> {
-    active_filter_summaries(content)
-        .into_iter()
-        .map(|(_, pattern)| pattern)
-        .collect()
+    match toml::from_str::<TomlFilterFile>(content) {
+        Ok(file) if file.schema_version == 1 => file
+            .filters
+            .into_values()
+            .map(|def| def.match_command)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -493,7 +503,8 @@ pub fn apply_filter(filter: &CompiledFilter, stdout: &str) -> String {
 #[derive(Debug, PartialEq)]
 pub enum Lossiness {
     None,
-    /// `tail -n +{tail_offset}` over `tee_payload` reproduces the dropped lines.
+    /// `tail -n +{tail_offset}` over `tee_payload` reproduces the dropped lines,
+    /// up to the tee `max_file_size` cap (larger payloads are truncated in the tee file).
     Tail {
         tee_payload: String,
         tail_offset: usize,
@@ -630,7 +641,7 @@ pub fn apply_filter_with_info(filter: &CompiledFilter, stdout: &str) -> (String,
             },
             (None, None) => Lossiness::None,
         }
-    } else if noncontiguous_drop || intra_line_loss {
+    } else if noncontiguous_drop || intra_line_loss || head_cut.is_some() || max_cut.is_some() {
         Lossiness::Whole
     } else {
         Lossiness::None
@@ -820,6 +831,35 @@ mod tests {
                 "match-set disagreed with registry for {cmd:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_loss_tail_configured_unfired_max_fires_is_whole() {
+        let toml = "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\ntail_lines = 100\nmax_lines = 2\n";
+        let (out, loss) = apply_filter_with_info(&first_filter(toml), "a\nb\nc\nd\ne");
+        assert!(out.contains("lines truncated"));
+        assert_ne!(loss, Lossiness::None);
+    }
+
+    #[test]
+    fn test_match_patterns_in_honors_schema_version() {
+        let v1 = "schema_version = 1\n[filters.a]\nmatch_command = \"^aaa\"\n";
+        assert_eq!(match_patterns_in(v1), vec!["^aaa".to_string()]);
+
+        let v2 = "schema_version = 2\n[filters.a]\nmatch_command = \"^aaa\"\n";
+        assert!(match_patterns_in(v2).is_empty());
+
+        assert!(match_patterns_in("not valid toml {{{").is_empty());
+    }
+
+    #[test]
+    fn test_filter_parse_error() {
+        assert!(
+            filter_parse_error("schema_version = 1\n[filters.a]\nmatch_command = \"^a\"\n")
+                .is_none()
+        );
+        assert!(filter_parse_error("[filters.a]\nmatch_command = \"^a\"\n").is_some());
+        assert!(filter_parse_error("this is { not toml").is_some());
     }
 
     #[test]
