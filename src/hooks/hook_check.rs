@@ -1,16 +1,11 @@
 //! Detects whether RTK hooks are installed and warns if they are outdated.
 
-use super::constants::{
-    CLAUDE_DIR, CLAUDE_HOOK_COMMAND, HOOKS_SUBDIR, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE,
-    SETTINGS_JSON,
-};
-#[cfg(test)]
-use super::constants::{CODEX_DIR, CURSOR_DIR, GEMINI_DIR, GEMINI_HOOK_FILE, OPENCODE_PLUGIN_PATH};
-use crate::core::constants::RTK_DATA_DIR;
+use super::constants::{HOOKS_SUBDIR, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON};
+use super::init::resolve_claude_dir;
+use super::is_claude_hook_command;
 use std::path::PathBuf;
 
 const CURRENT_HOOK_VERSION: u8 = 3;
-const WARN_INTERVAL_SECS: u64 = 24 * 3600;
 
 /// Hook status for diagnostics and `rtk gain`.
 #[derive(Debug, PartialEq, Clone)]
@@ -27,11 +22,10 @@ pub enum HookStatus {
 /// Returns `Ok` if no Claude Code is detected (not applicable).
 pub fn status() -> HookStatus {
     // Don't warn users who don't have Claude Code installed
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => return HookStatus::Ok,
+    let claude_dir = match resolve_claude_dir() {
+        Ok(d) => d,
+        Err(_) => return HookStatus::Ok,
     };
-    let claude_dir = home.join(CLAUDE_DIR);
     if !claude_dir.exists() {
         return HookStatus::Ok;
     }
@@ -85,19 +79,12 @@ fn binary_hook_registered(claude_dir: &std::path::Path) -> bool {
         .filter_map(|entry| entry.get("hooks")?.as_array())
         .flatten()
         .filter_map(|hook| hook.get("command")?.as_str())
-        .any(|cmd| cmd == CLAUDE_HOOK_COMMAND)
+        .any(is_claude_hook_command)
 }
 
-/// Check if the installed hook is missing or outdated, warn once per day.
+/// Check the installed hook status without emitting a warning.
 pub fn maybe_warn() {
-    // Don't block startup — fail silently on any error
-    let _ = check_and_warn();
-}
-
-/// Single source of truth: delegates to `status()` then rate-limits the warning.
-fn check_and_warn() -> Option<()> {
     let _ = status();
-    Some(())
 }
 
 pub fn parse_hook_version(content: &str) -> u8 {
@@ -112,27 +99,9 @@ pub fn parse_hook_version(content: &str) -> u8 {
     0 // No version tag = version 0 (outdated)
 }
 
-#[cfg(test)]
-fn other_integration_installed(home: &std::path::Path) -> bool {
-    let paths = [
-        home.join(OPENCODE_PLUGIN_PATH),
-        home.join(CURSOR_DIR)
-            .join(HOOKS_SUBDIR)
-            .join(REWRITE_HOOK_FILE),
-        home.join(CODEX_DIR).join("AGENTS.md"),
-        home.join(GEMINI_DIR)
-            .join(HOOKS_SUBDIR)
-            .join(GEMINI_HOOK_FILE),
-    ];
-    paths.iter().any(|p| p.exists())
-}
-
 fn hook_installed_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let path = home
-        .join(CLAUDE_DIR)
-        .join(HOOKS_SUBDIR)
-        .join(REWRITE_HOOK_FILE);
+    let claude_dir = resolve_claude_dir().ok()?;
+    let path = claude_dir.join(HOOKS_SUBDIR).join(REWRITE_HOOK_FILE);
     if path.exists() {
         Some(path)
     } else {
@@ -140,14 +109,35 @@ fn hook_installed_path() -> Option<PathBuf> {
     }
 }
 
-fn warn_marker_path() -> Option<PathBuf> {
-    let data_dir = dirs::data_local_dir()?.join(RTK_DATA_DIR);
-    Some(data_dir.join(".hook_warn_last"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::constants::{
+        CODEX_DIR, CONFIG_DIR, CURSOR_DIR, GEMINI_DIR, GEMINI_HOOK_FILE, HERMES_DIR,
+        HERMES_PLUGINS_SUBDIR, HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME,
+        OPENCODE_PLUGIN_FILE, OPENCODE_SUBDIR, PLUGIN_SUBDIR,
+    };
+
+    fn other_integration_installed(home: &std::path::Path) -> bool {
+        let paths = [
+            home.join(CONFIG_DIR)
+                .join(OPENCODE_SUBDIR)
+                .join(PLUGIN_SUBDIR)
+                .join(OPENCODE_PLUGIN_FILE),
+            home.join(CURSOR_DIR)
+                .join(HOOKS_SUBDIR)
+                .join(REWRITE_HOOK_FILE),
+            home.join(CODEX_DIR).join("AGENTS.md"),
+            home.join(GEMINI_DIR)
+                .join(HOOKS_SUBDIR)
+                .join(GEMINI_HOOK_FILE),
+            home.join(HERMES_DIR)
+                .join(HERMES_PLUGINS_SUBDIR)
+                .join(HERMES_PLUGIN_NAME)
+                .join(HERMES_PLUGIN_MANIFEST_FILE),
+        ];
+        paths.iter().any(|p| p.exists())
+    }
 
     #[test]
     fn test_parse_hook_version_present() {
@@ -184,6 +174,29 @@ mod tests {
     }
 
     #[test]
+    fn test_binary_hook_registered_accepts_absolute_rtk_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(SETTINGS_JSON),
+            r#"{
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "/opt/homebrew/bin/rtk hook claude",
+                            "timeout": 5
+                        }]
+                    }]
+                }
+            }"#,
+        )
+        .expect("write settings");
+
+        assert!(binary_hook_registered(tmp.path()));
+    }
+
+    #[test]
     fn test_other_integration_none() {
         let tmp = tempfile::tempdir().expect("tempdir");
         assert!(!other_integration_installed(tmp.path()));
@@ -192,7 +205,12 @@ mod tests {
     #[test]
     fn test_other_integration_opencode() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join(OPENCODE_PLUGIN_PATH);
+        let path = tmp
+            .path()
+            .join(CONFIG_DIR)
+            .join(OPENCODE_SUBDIR)
+            .join(PLUGIN_SUBDIR)
+            .join(OPENCODE_PLUGIN_FILE);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"plugin").unwrap();
         assert!(other_integration_installed(tmp.path()));
@@ -234,11 +252,32 @@ mod tests {
     }
 
     #[test]
+    fn test_other_integration_hermes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp
+            .path()
+            .join(HERMES_DIR)
+            .join(HERMES_PLUGINS_SUBDIR)
+            .join(HERMES_PLUGIN_NAME)
+            .join(HERMES_PLUGIN_MANIFEST_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"plugin").unwrap();
+        assert!(other_integration_installed(tmp.path()));
+    }
+
+    #[test]
     fn test_other_integration_empty_dirs_not_enough() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(CURSOR_DIR).join(HOOKS_SUBDIR)).unwrap();
         std::fs::create_dir_all(tmp.path().join(CODEX_DIR)).unwrap();
         std::fs::create_dir_all(tmp.path().join(GEMINI_DIR)).unwrap();
+        std::fs::create_dir_all(
+            tmp.path()
+                .join(HERMES_DIR)
+                .join(HERMES_PLUGINS_SUBDIR)
+                .join(HERMES_PLUGIN_NAME),
+        )
+        .unwrap();
         assert!(!other_integration_installed(tmp.path()));
     }
 
